@@ -2,6 +2,7 @@ use crate::{module::Module, pci::PciBus};
 use std::{
     fs,
     io::{self, Write},
+    string::FromUtf8Error,
     iter::FromIterator,
     process::{self, ExitStatus},
 };
@@ -47,8 +48,12 @@ pub enum GraphicsDeviceError {
     Rescan(io::Error),
     #[error(display = "failed to unbind {} on PCI driver {}: {}", func, driver, why)]
     Unbind { func: String, driver: String, why: io::Error },
-    #[error(display = "mkinitrd failed with {} status", _0)]
+    #[error(display = "dracut failed with {} status", _0)]
     UpdateInitramfs(ExitStatus),
+    #[error(display = "update-alternatives failed with {} status", _0)]
+    UpdateAlternatives(ExitStatus),
+    #[error(display = "failed to convert string from {} command: {}", cmd, why)]
+    UpdateAlternativesString { cmd: &'static str, why: FromUtf8Error },
 }
 
 pub struct GraphicsDevice {
@@ -249,13 +254,46 @@ impl Graphics {
         }
 
         info!("Updating initramfs");
-        const UPDATE_INITRAMFS_CMD: &str = "mkinitrd";
+        const UPDATE_INITRAMFS_CMD: &str = "dracut";
         let status = process::Command::new(UPDATE_INITRAMFS_CMD)
+            .arg("-f")
             .status()
             .map_err(|why| GraphicsDeviceError::Command { cmd: UPDATE_INITRAMFS_CMD, why })?;
 
         if !status.success() {
             return Err(GraphicsDeviceError::UpdateInitramfs(status));
+        }
+
+
+        const UPDATE_ALTERNATIVES_CMD: &str = "update-alternatives";
+        let alternatives = process::Command::new(UPDATE_ALTERNATIVES_CMD)
+                .arg("--list")
+                .arg("libglx.so")
+                .output()
+                .map_err(|why| GraphicsDeviceError::Command {cmd: UPDATE_ALTERNATIVES_CMD, why })?;
+        let alternatives = String::from_utf8(alternatives.stdout)
+                .map_err(|why| GraphicsDeviceError::UpdateAlternativesString {cmd: UPDATE_ALTERNATIVES_CMD, why })?;
+
+        let libglx = if vendor == "intel" { "xorg-libglx.so" } else { "nvidia-libglx.so" };
+        let mut alternative = String::new();
+        for line in alternatives.lines() {
+            if line.contains(libglx) {
+                alternative = line.to_string();
+                break
+            }
+        };
+        info!("Alternative path is: {}", alternative);
+
+        info!("Updating libglx.so alternative");
+        let status = process::Command::new(UPDATE_ALTERNATIVES_CMD)
+            .arg("--set")
+            .arg("libglx.so")
+            .arg(alternative)
+            .status()
+            .map_err(|why| GraphicsDeviceError::Command { cmd: UPDATE_ALTERNATIVES_CMD, why })?;
+
+        if !status.success() {
+            return Err(GraphicsDeviceError::UpdateAlternatives(status));
         }
 
         Ok(())
